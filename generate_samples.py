@@ -34,6 +34,8 @@ from model import GPT2Model
 from model import DistributedDataParallel as DDP
 from utils import print_rank_0
 
+from flask import Flask, request, abort
+
 USE_TORCH_DDP = False
 
 def get_masks_and_position_ids(data,
@@ -101,8 +103,7 @@ def initialize_distributed(args):
     init_method = 'tcp://'
     master_ip = os.getenv('MASTER_ADDR', 'localhost')
     master_port = os.getenv('MASTER_PORT', '6000')
-    #init_method += master_ip + ':' + master_port
-    init_method += master_ip + ':' + '12580'
+    init_method += master_ip + ':' + master_port
     torch.distributed.init_process_group(
         backend=args.distributed_backend,
         world_size=args.world_size, rank=args.rank,
@@ -162,117 +163,81 @@ def top_k_logits(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
     return logits
 
 
-def generate_samples(model, tokenizer, args, device):
-    
-    context_count=0
+def generate_samples(raw_text, stop_words, model, tokenizer, args, device):
     model.eval()
     with torch.no_grad():
-        while True:
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
-            terminate_runs=0
+        torch.distributed.barrier(group=mpu.get_model_parallel_group())
 
-            if mpu.get_model_parallel_rank() == 0:
-                if args.input_text:
-                    raw_text = open(args.input_text).read().strip()
-                else:
-                    raw_text = input("\nContext prompt (stop to exit) >>> ")
-                    while not raw_text:
-                        print('Prompt should not be empty!')
-                        raw_text = input("\nContext prompt (stop to exit) >>> ")
-           
-                if "stop" in raw_text:
-                    terminate_runs = 1
-                else:
-                    #context_tokens = tokenizer.EncodeAsIds(raw_text).tokenization
-                    context_tokens = tokenizer.encode(raw_text)
-                    context_length = len(context_tokens)
+        if mpu.get_model_parallel_rank() == 0:
+            context_tokens = tokenizer.encode(raw_text)
+            context_length = len(context_tokens)
+        else:
+            context_tokens = tokenizer.encode("空文本")
+            context_length = len(context_tokens)
+        
+        pad_id = tokenizer.encoder['<pad>']
+        args.eod_token = tokenizer.encoder['<eod>']
+        stop_words = [tokenizer.encode(word) for word in stop_words]
+        stop_words.append(args.eod_token)
+        if context_length < args.seq_length:
+            context_tokens.extend([pad_id] * (args.seq_length - context_length))
 
-                    if context_length >=args.seq_length//2:
-                        print("\nContext length", context_length, \
-                            "\nPlease give smaller context (half of the sequence length)!")
-                        continue
+        context_tokens_tensor = torch.cuda.LongTensor(context_tokens)
+        context_length_tensor = torch.cuda.LongTensor([context_length])
+
+        torch.distributed.broadcast(context_length_tensor, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
+        torch.distributed.broadcast(context_tokens_tensor, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
+
+        context_length = context_length_tensor[0].item()
+        tokens, attention_mask, position_ids = get_batch(context_tokens_tensor, device, args)
+
+        start_time = time.time()
+
+        counter = 0
+        past_key_values = None
+        while counter <  args.out_seq_length:
+            if counter == 0:
+                logits, past_key_values = model(
+                    tokens[:, :context_length], 
+                    position_ids[:, :context_length], 
+                    attention_mask[:, :, :context_length, :context_length], 
+                    past_key_values=past_key_values, 
+                    use_cache=True)
+                logits = logits[:, context_length - 1, :]
             else:
-                #context_tokens = tokenizer.EncodeAsIds("EMPTY TEXT").tokenization
-                context_tokens = tokenizer.encode("空文本")
-                context_length = len(context_tokens)
-            
-            terminate_runs_tensor = torch.cuda.LongTensor([terminate_runs])
-            torch.distributed.broadcast(terminate_runs_tensor, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
-            terminate_runs = terminate_runs_tensor[0].item()
+                logits, past_key_values = model(
+                    tokens[:, context_length - 1 : context_length], 
+                    position_ids[:, context_length - 1 : context_length], 
+                    attention_mask[:, :, context_length - 1, :context_length], 
+                    past_key_values=past_key_values, 
+                    use_cache=True)
+                logits = logits[:, 0, :]
 
-            if terminate_runs == 1:
-                return
+            if args.fp16: 
+                past_key_values = [x.half() for x in past_key_values]
+            else:
+                past_key_values = [x for x in past_key_values]
+            logits = top_k_logits(logits, top_k=args.top_k, top_p=args.top_p)            
+            log_probs = F.softmax(logits/args.temperature, dim=-1)
+            prev = torch.multinomial(log_probs, num_samples=1)
 
-            pad_id = tokenizer.encoder['<pad>']
-            args.eod_token = tokenizer.encoder['<eod>']
-            if context_length < args.seq_length:
-                context_tokens.extend([pad_id] * (args.seq_length - context_length))
+            sampled_token = prev[0]
+            tokens[0, context_length] = sampled_token
+            torch.distributed.broadcast(tokens, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
+            context_length += 1
+            counter += 1
 
-            context_tokens_tensor = torch.cuda.LongTensor(context_tokens)
-            context_length_tensor = torch.cuda.LongTensor([context_length])
-
-            torch.distributed.broadcast(context_length_tensor, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
-            torch.distributed.broadcast(context_tokens_tensor, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
-
-            context_length = context_length_tensor[0].item()
-            tokens, attention_mask, position_ids=get_batch(context_tokens_tensor, device, args)
-
-            start_time = time.time()
-
-            counter = 0
-            org_context_length = context_length
-
-            past_key_values = None
-            while counter < (org_context_length + args.out_seq_length):
-                if counter == 0:
-                    logits, past_key_values = model(tokens[:, :context_length], position_ids[:, :context_length], attention_mask[:, :, :context_length, :context_length], past_key_values=past_key_values, use_cache=True)
-                    logits = logits[:, context_length - 1, :]
-                else:
-                    logits, past_key_values = model(tokens[:, context_length - 1 : context_length], position_ids[:, context_length - 1 : context_length], attention_mask[:, :, context_length - 1, :context_length], past_key_values=past_key_values, use_cache=True)
-                    logits = logits[:, 0, :]
-                if args.fp16: 
-                    past_key_values = [x.half() for x in past_key_values]
-                else:
-                    past_key_values = [x for x in past_key_values]
-                logits = top_k_logits(logits, top_k=args.top_k, top_p=args.top_p)            
-                log_probs = F.softmax(logits/args.temperature, dim=-1)
-                prev = torch.multinomial(log_probs, num_samples=1)
-                tokens[0, context_length] = prev[0] 
-                torch.distributed.broadcast(tokens, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
-                context_length += 1
-                counter += 1
-
-                output_tokens_list = tokens.view(-1).contiguous()
-                decode_tokens = tokenizer.decode(output_tokens_list.tolist())
-                token_end = decode_tokens.find("<eod>")
-
-
-                if mpu.get_model_parallel_rank() == 0 and (counter % 16 == 0 or token_end != -1):
-                   os.system('clear')
-                   print("\nTaken time {:.2f}\n".format(time.time() - start_time), flush=True)
-                   print("\nContext:", raw_text, flush=True)
-                   trim_decode_tokens = decode_tokens[len(raw_text):decode_tokens.find("<eod>")]
-                   print("\nCPM:", trim_decode_tokens, flush=True)
-                if token_end != -1:
-                   #print(token_end)
-                   break
-                
-            if mpu.get_model_parallel_rank() == 0:
-                os.system('clear')
-                print("\nTaken time {:.2f}\n".format(time.time() - start_time), flush=True)
-                print("\nContext:", raw_text, flush=True)
-                output_tokens_list = tokens.view(-1).contiguous()
-                decode_tokens = tokenizer.decode(output_tokens_list.tolist())
-                trim_decode_tokens = decode_tokens[len(raw_text):decode_tokens.find("<eod>")]
-                print("\nCPM:", trim_decode_tokens, flush=True)
-                #print(token_end)
-            raw_text = None
-
-            torch.distributed.barrier(group=mpu.get_model_parallel_group())
-            context_count += 1
-
-            if args.input_text:
+            print('{} in {}'.format(sampled_token, stop_words))
+            if sampled_token in stop_words:
                 break
+        
+        output_tokens_list = tokens.view(-1).contiguous()
+        decode_tokens = tokenizer.decode(output_tokens_list.tolist())
+        trim_decode_tokens = decode_tokens[len(raw_text):decode_tokens.find("<eod>")]
+
+        torch.distributed.barrier(group=mpu.get_model_parallel_group())
+        return trim_decode_tokens
+
 
 def prepare_tokenizer(args):
 
@@ -346,12 +311,9 @@ def setup_model(args):
 
     return model
 
+
 def main():
-    """Main training program."""
 
-    print('Generate Samples')
-
-    # Disable CuDNN.
     torch.backends.cudnn.enabled = False
 
     # Timer.
@@ -367,7 +329,10 @@ def main():
     set_random_seed(args.seed)
 
     #get the tokenizer
-    tokenizer = GPT2Tokenizer(os.path.join(args.tokenizer_path, 'vocab.json'), os.path.join(args.tokenizer_path, 'chinese_vocab.model'))
+    tokenizer = GPT2Tokenizer(
+        os.path.join(args.tokenizer_path, 'vocab.json'), 
+        os.path.join(args.tokenizer_path, 'chinese_vocab.model')
+    )
 
     # Model
     args.parallel_output = False
@@ -376,12 +341,42 @@ def main():
     #setting default batch size to 1
     args.batch_size = 1
 
-    #generate samples
-    generate_samples(model, tokenizer, args, torch.cuda.current_device())
-    
+    PROMPT_KEY = 'prompt'
+    MAX_TOKENS_KEY = 'max_length'
+    TEMPERATURE_KEY = 'temperature'
+    TOP_K_KEY = 'top_k'
+    TOP_P_KEY = 'top_p'
+    STOP_WORDS_KEY = 'stop_words'
 
-if __name__ == "__main__":
+    DEFAULT_MAX_TOKEN = 128
+    DEFAULT_TEMPERATURE = 0.85
+    DEFAULT_TOP_P = 0.8
+    DEFAULT_TOP_K = 50
+
+    app = Flask(__name__)
+
+    @app.route('/generation', methods=['POST'])
+    def generation():
+        if not request.json or not PROMPT_KEY in request.json or not STOP_WORDS_KEY in request.json:
+            abort(400)
+
+        prompt = request.json[PROMPT_KEY]
+        stop_words = request.json[STOP_WORDS_KEY]
+        max_token = request.json[MAX_TOKENS_KEY] if MAX_TOKENS_KEY in request.json else DEFAULT_MAX_TOKEN
+        temperature = request.json[TEMPERATURE_KEY] if TEMPERATURE_KEY in request.json else DEFAULT_TEMPERATURE
+        top_p = request.json[TOP_P_KEY] if TOP_P_KEY in request.json else DEFAULT_TOP_P
+        top_k = request.json[TOP_K_KEY] if TOP_K_KEY in request.json else DEFAULT_TOP_K
+
+        args.out_seq_length = max_token
+        args.temperature = temperature
+        args.top_k = top_k
+        args.top_p = top_p
+        result = generate_samples(prompt, stop_words, model, tokenizer, args, torch.cuda.current_device())
+
+        return result, 200
+
+    app.run()
+
+
+if __name__ == '__main__':
     main()
-
-
-
