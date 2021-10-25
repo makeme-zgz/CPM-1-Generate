@@ -363,7 +363,7 @@ def main():
         args.top_k = top_k
         args.top_p = top_p
         result = generate_samples(prompt, stop_words, model, tokenizer, args, torch.cuda.current_device())
-
+        result = result.replace(',', '，')
         return result, 200
 
     app.run(host='0.0.0.0')
