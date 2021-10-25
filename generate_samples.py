@@ -164,6 +164,10 @@ def top_k_logits(logits, top_k=0, top_p=0.0, filter_value=-float('Inf')):
 
 
 def generate_samples(raw_text, stop_words, model, tokenizer, args, device):
+    pad_id = tokenizer.encoder['<pad>']
+    args.eod_token = tokenizer.encoder['<eod>']
+    token_id = tokenizer.encoder['\u2581']
+
     model.eval()
     with torch.no_grad():
         torch.distributed.barrier(group=mpu.get_model_parallel_group())
@@ -175,24 +179,33 @@ def generate_samples(raw_text, stop_words, model, tokenizer, args, device):
             context_tokens = tokenizer.encode("空文本")
             context_length = len(context_tokens)
         
-        pad_id = tokenizer.encoder['<pad>']
-        args.eod_token = tokenizer.encoder['<eod>']
-        stop_words = [tokenizer.encode(word) for word in stop_words]
-        stop_words.append(args.eod_token)
         if context_length < args.seq_length:
             context_tokens.extend([pad_id] * (args.seq_length - context_length))
 
         context_tokens_tensor = torch.cuda.LongTensor(context_tokens)
         context_length_tensor = torch.cuda.LongTensor([context_length])
 
-        torch.distributed.broadcast(context_length_tensor, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
-        torch.distributed.broadcast(context_tokens_tensor, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
+        torch.distributed.broadcast(
+            context_length_tensor, 
+            mpu.get_model_parallel_src_rank(), 
+            group=mpu.get_model_parallel_group())
+        torch.distributed.broadcast(
+            context_tokens_tensor, 
+            mpu.get_model_parallel_src_rank(), 
+            group=mpu.get_model_parallel_group())
 
         context_length = context_length_tensor[0].item()
         tokens, attention_mask, position_ids = get_batch(context_tokens_tensor, device, args)
 
-        start_time = time.time()
+        # Tokenize stop words
+        stop_word_ids = []
+        for word in stop_words:
+            ids = tokenizer.encode(word)
+            ids.remove(token_id)
+            stop_word_ids += ids
+        stop_word_ids.append(args.eod_token)
 
+        start_time = time.time()
         counter = 0
         past_key_values = None
         while counter <  args.out_seq_length:
@@ -223,12 +236,14 @@ def generate_samples(raw_text, stop_words, model, tokenizer, args, device):
 
             sampled_token = prev[0]
             tokens[0, context_length] = sampled_token
-            torch.distributed.broadcast(tokens, mpu.get_model_parallel_src_rank(), group=mpu.get_model_parallel_group())
+            torch.distributed.broadcast(
+                tokens, 
+                mpu.get_model_parallel_src_rank(), 
+                group=mpu.get_model_parallel_group())
             context_length += 1
             counter += 1
 
-            print('{} in {}'.format(sampled_token, stop_words))
-            if sampled_token in stop_words:
+            if sampled_token in stop_word_ids:
                 break
         
         output_tokens_list = tokens.view(-1).contiguous()
@@ -238,30 +253,6 @@ def generate_samples(raw_text, stop_words, model, tokenizer, args, device):
         torch.distributed.barrier(group=mpu.get_model_parallel_group())
         return trim_decode_tokens
 
-
-def prepare_tokenizer(args):
-
-    tokenizer_args = {
-        'tokenizer_type': args.tokenizer_type,
-        'corpus': None,
-        'model_path': args.tokenizer_path,
-        'vocab_size': args.vocab_size,
-        'model_type': args.tokenizer_model_type,
-        'cache_dir': args.cache_dir}
-    tokenizer = make_tokenizer(**tokenizer_args)
-
-    args.tokenizer_num_tokens = tokenizer.num_tokens
-    args.tokenizer_num_type_tokens = tokenizer.num_type_tokens
-    args.eod_token = tokenizer.get_command('eos').Id
-
-    after = tokenizer.num_tokens
-    while after % mpu.get_model_parallel_world_size() != 0:
-        after += 1
-
-    args.vocab_size = after
-    print("prepare tokenizer done", flush=True)
-
-    return tokenizer
 
 def get_model(args):
     """Build the model."""
@@ -375,7 +366,7 @@ def main():
 
         return result, 200
 
-    app.run()
+    app.run(host='0.0.0.0')
 
 
 if __name__ == '__main__':
